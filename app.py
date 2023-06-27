@@ -4,15 +4,14 @@ from spex_common.modules.database import db_instance
 from spex_common.services.Timer import every
 import spex_common.services.Pipeline as PipelineService
 import spex_common.services.Job as JobService
-from spex_common.models.Status import PipelineStatus
 import logging
 
 logger = get_logger("pipeline_manager")
 collection = "pipeline"
 
 
-def update_box_status(data, status):
-    if data.get("status") == status:
+def update_box_status(data, status: int = None):
+    if data.get("status") == status or data.get("status") == 100:
         return
 
     job_id = data.get("id")
@@ -21,20 +20,38 @@ def update_box_status(data, status):
     JobService.update_job(job_id, data)
 
 
-def recursion(data, _status: int = None):
-    if data is None:
-        return
+def check_update_status_job(jobs_list: list[dict]):
 
-    tasks = data.get("tasks")
-    if tasks is not None and len(tasks) > 0:
-        status = min(item.get("status") for item in tasks if item.get("status") is not None)
-        update_box_status(data, status)
+    for job in jobs_list:
+        if tasks := job.get("tasks", []):
+            tasks_status = min(
+                [
+                    task.get("status", 0)
+                    for task in tasks if task.get("status") is not None
+                ]
+            )
+            if job.get('status') == 0 and tasks_status == -2:
+                tasks_status = 0
+            if job.get('status') != tasks_status and job.get('status') != 100:
+                update_box_status(job, tasks_status)
+            if child_jobs := job.get("jobs", []):
+                check_update_status_job(child_jobs)
 
-    if len(data.get("jobs", [])) < 1:
-        return
 
-    for item in data.get("jobs", []):
-        recursion(item, _status=_status)
+def start_next_job(jobs_list: list[dict]):
+    for job in jobs_list:
+        if job.get("status") == 100:
+            if child_jobs := job.get("jobs", []):
+                for child_job in child_jobs:
+                    if child_job.get("status") == -2 and child_job.get("status") != 100:
+                        update_box_status(child_job, 0)
+                start_next_job(child_jobs)
+            else:
+                return
+
+
+def nearly_equal(n1, n2, epsilon=1):
+    return abs(n1 - n2) <= epsilon
 
 
 def get_box():
@@ -44,12 +61,9 @@ def get_box():
     for line in lines:
         logger.debug(f"processing pipeline: {line['_key']}")
         if data := PipelineService.get_tree(line["_key"]):
-            status = None
-            if data[0].get("status") in [PipelineStatus.stopped.value, PipelineStatus.started.value]:
-                status = data[0].get("status")
 
-            recursion(data[0], _status=status)
-
+            check_update_status_job(data[0].get("jobs", []))
+            start_next_job(data[0].get("jobs", []))
             job_ids = PipelineService.get_jobs(data[0].get('jobs', []))
             jobs = JobService.select_jobs(condition="in", _id=job_ids)
             pipeline_status = 0
@@ -57,7 +71,7 @@ def get_box():
                 for job in jobs:
                     pipeline_status += job.get('status', 0)
                 pipeline_status = int(round(pipeline_status / len(jobs), 0))
-                if data[0].get("status") != pipeline_status:
+                if not nearly_equal(data[0].get("status", -100), pipeline_status):
                     updated = PipelineService.update(
                         data[0].get('id'),
                         data={"complete": pipeline_status},
