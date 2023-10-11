@@ -10,79 +10,77 @@ logger = get_logger("pipeline_manager")
 collection = "pipeline"
 
 
-def update_box_status(data, status: int = None):
-    if data.get("status") == status or data.get("status") == 100:
+def update_job_status(job_data, new_status):
+    current_status = job_data.get("status")
+    if current_status == new_status or current_status == 100:
         return
-
-    job_id = data.get("id")
-    data = {"status": status}
-    logger.debug(f"job {job_id} updating {data}")
-    JobService.update_job(job_id, data)
-
-
-def check_update_status_job(jobs_list: list[dict]):
-
-    for job in jobs_list:
-        if tasks := job.get("tasks", []):
-            tasks_status = min(
-                [
-                    task.get("status", 0)
-                    for task in tasks if task.get("status") is not None
-                ]
-            )
-            if job.get('status') == 0 and tasks_status == -2:
-                tasks_status = 0
-            if job.get('status') != tasks_status and job.get('status') != 100:
-                update_box_status(job, tasks_status)
-            if child_jobs := job.get("jobs", []):
-                check_update_status_job(child_jobs)
+    if (new_status < 0 or new_status == 100) or current_status is None:
+        job_id = job_data.get("id")
+        update_data = {"status": new_status}
+        logger.debug(f"Updating job {job_id} with {update_data}")
+        JobService.update_job(job_id, update_data)
 
 
-def start_next_job(jobs_list: list[dict]):
-    for job in jobs_list:
+def get_minimum_task_status(tasks):
+    return min([task.get("status", 0) for task in tasks if task.get("status") is not None])
+
+
+def update_statuses_for_jobs(job_list):
+    for job in job_list:
+        if tasks := job.get("tasks"):
+            min_task_status = get_minimum_task_status(tasks)
+            if job.get('status') == 0 and min_task_status == -2:
+                min_task_status = 0
+            if job.get('status') != min_task_status and job.get('status') != 100:
+                update_job_status(job, min_task_status)
+        if child_jobs := job.get("jobs"):
+            update_statuses_for_jobs(child_jobs)
+
+
+def start_ready_jobs(job_list):
+    for job in job_list:
         if job.get("status") == 100:
-            if child_jobs := job.get("jobs", []):
+            if child_jobs := job.get("jobs"):
                 for child_job in child_jobs:
-                    if child_job.get("status") == -2 and child_job.get("status") != 100:
-                        update_box_status(child_job, 0)
-                start_next_job(child_jobs)
-            else:
-                return
+                    if child_job.get("status") == -2:
+                        update_job_status(child_job, 0)
+                start_ready_jobs(child_jobs)
 
 
-def nearly_equal(n1, n2, epsilon=1):
+def is_nearly_equal(n1, n2, epsilon=1):
     return abs(n1 - n2) <= epsilon
 
 
-def get_box():
+def process_pipelines():
     logger.info("working")
-    lines = db_instance().select(collection, " FILTER doc.complete <= 100")
-    logger.info(f"uncompleted pipelines: {len(lines)}")
-    for line in lines:
-        logger.debug(f"processing pipeline: {line['_key']}")
-        if data := PipelineService.get_tree(line["_key"]):
+    pipelines = db_instance().select(collection, "FILTER doc.complete <= 100")
+    logger.info(f"Uncompleted pipelines: {len(pipelines)}")
 
-            check_update_status_job(data[0].get("jobs", []))
-            start_next_job(data[0].get("jobs", []))
-            job_ids = PipelineService.get_jobs(data[0].get('jobs', []))
-            jobs = JobService.select_jobs(condition="in", _id=job_ids)
-            pipeline_status = 0
-            if jobs is not None:
-                for job in jobs:
-                    pipeline_status += job.get('status', 0)
-                pipeline_status = int(round(pipeline_status / len(jobs), 0))
-                if not nearly_equal(data[0].get("status", -100), pipeline_status):
-                    updated = PipelineService.update(
-                        data[0].get('id'),
-                        data={"complete": pipeline_status},
-                        collection='pipeline'
-                    )
-                    if updated:
-                        logger.debug(f"processing pipeline: {line['_key']} changed status to: {pipeline_status}")
+    for pipeline in pipelines:
+        pipeline_data = PipelineService.get_tree(pipeline["_key"])
+        if not pipeline_data:
+            continue
+
+        first_level_jobs = pipeline_data[0].get("jobs", [])
+        update_statuses_for_jobs(first_level_jobs)
+        start_ready_jobs(first_level_jobs)
+
+        job_ids = PipelineService.get_jobs(first_level_jobs)
+        jobs_status_data = JobService.select_jobs(condition="in", _id=job_ids)
+
+        if jobs_status_data:
+            total_status = sum(job.get('status', 0) for job in jobs_status_data)
+            average_status = int(round(total_status / len(jobs_status_data), 0))
+            if not is_nearly_equal(pipeline_data[0].get("status", -100), average_status):
+                PipelineService.update(
+                    pipeline_data[0].get('id'),
+                    data={"complete": average_status},
+                    collection='pipeline'
+                )
+                logger.debug(f"Updated pipeline {pipeline['_key']} status to {average_status}")
 
 
 if __name__ == "__main__":
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-
     load_config()
-    every(10, get_box)
+    every(10, process_pipelines)
